@@ -863,6 +863,62 @@ class StateSpace(LTI):
 
         return eigvals(self.A) if self.nstates else np.array([])
 
+    def __compress_system(self, A, B, C, D):
+        """Reduce the system to one with the same invariant zeroes and with D of
+        full row rank.
+
+        Inputs
+        ------
+        A:
+        B:
+        C:
+        D:
+
+        Returns
+        -------
+        A:
+        B:
+        C:
+        D:
+        """
+        # Construct the compound matrix [A, B; C, D]
+        ABCD concatenate((concatenate((A, B), axis=1),
+                          concatenate((C, D), axis=1)), axis=0)
+        U, S, V = np.linalg.svd(ABCD)
+        Urows, Ucols = U.shape
+        Vrows, Vcols = V.shape
+
+        n = self.A.shape[0]  # States
+        m = self.D.shape[1]  # Inputs
+        p = self.C.shape[0]  # Outputs
+        e = n + p - Ucols
+        f = n + m - Vrows
+        Upad = concatenate((concatenate((U, zeros((Urows, e))), axis=1),
+                            concatenate((zeros((e, Ucols)), eye(e)), axis=1)),
+                           axis=0)
+        Vpad = concatenate((concatenate((V, zeros((Vrows, f))), axis=1),
+                            concatenate((zeros((f, Vcols)), eye(f)), axis=1)),
+                           axis=0)
+        out = Upad * ABCD * Vpad
+        A11 = out[:n - p, :n - p]
+        A12 = out[:n - p, n - p:n]
+        A21 = out[n - p:n, :n - p]
+        A22 = out[n - p:n, n - p:n]
+        B1 = out[:n - p, n:n + m]
+        B2 = out[n - p:n, n:n + m]
+        C1 = out[n:n + p, :n - p]
+        C2 = out[n:n + p, n - p:n]
+        D = out[n:n + p, n:n + m]
+
+        A = A11
+        B = concatenate((A12, B1), axis=1)
+        C = concatenate((A21, C1), axis=0)
+        D = concatenate((concatenate((A22, B2), axis=1),
+                         concatenate((C2, D), axis=1)), axis=0)
+
+        return concatenate((concatenate((A, B), axis=1),
+                            concatenate((C, D), axis=1)), axis=0)
+
     def zero(self):
         """Compute the zeros of a state space system."""
 
@@ -884,10 +940,15 @@ class StateSpace(LTI):
                                          out[9][0:nu, 0:nu])
 
         except ImportError:  # Slycot unavailable. Fall back to scipy.
-            if self.C.shape[0] != self.D.shape[1]:
-                raise NotImplementedError("StateSpace.zero only supports "
-                                          "systems with the same number of "
-                                          "inputs as outputs.")
+            A, B, C, D = self.__compress_system(self.A, self.B, self.C, self.D)
+
+            Q, D1 = sp.linalg.qr(D, mode="economic")
+            tmp = Q * C
+
+            # This implements the algorithm from "Computation of Structural
+            # Invariants of Generalized State-space Systems" by Misra, Dooren,
+            # and Varga
+            # (https://perso.uclouvain.be/paul.vandooren/publications/MisraVV94.pdf)
 
             # This implements the QZ algorithm for finding transmission zeros
             # from
@@ -899,8 +960,7 @@ class StateSpace(LTI):
             #
             # The generalized eigenvalue problem is only solvable if its
             # arguments are square matrices.
-            L = concatenate((concatenate((self.A, self.B), axis=1),
-                             concatenate((self.C, self.D), axis=1)), axis=0)
+            L = ABCD
             M = pad(eye(self.A.shape[0]), ((0, self.C.shape[0]),
                                            (0, self.B.shape[1])), "constant")
             return np.array([x for x in sp.linalg.eigvals(L, M,
