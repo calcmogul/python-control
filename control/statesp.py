@@ -872,6 +872,7 @@ class StateSpace(LTI):
         # Use AB08ND from Slycot if it's available, otherwise use
         # scipy.lingalg.eigvals().
         try:
+            raise ImportError
             from slycot import ab08nd
 
             out = ab08nd(self.A.shape[0], self.B.shape[1], self.C.shape[0],
@@ -880,32 +881,279 @@ class StateSpace(LTI):
             if nu == 0:
                 return np.array([])
             else:
+                print("nu=", nu)
+                print("AF=", out[8][0:nu, 0:nu])
+                print("BF=", out[9][0:nu, 0:nu])
+                print(sp.linalg.eigvals(out[8][0:nu, 0:nu],
+                                        out[9][0:nu, 0:nu]))
                 return sp.linalg.eigvals(out[8][0:nu, 0:nu],
                                          out[9][0:nu, 0:nu])
-
         except ImportError:  # Slycot unavailable. Fall back to scipy.
-            if self.C.shape[0] != self.D.shape[1]:
-                raise NotImplementedError("StateSpace.zero only supports "
-                                          "systems with the same number of "
-                                          "inputs as outputs.")
+            #if self.C.shape[0] != self.D.shape[1]:
+            #    raise NotImplementedError("StateSpace.zero only supports "
+            #                              "systems with the same number of "
+            #                              "inputs as outputs.")
 
-            # This implements the QZ algorithm for finding transmission zeros
-            # from
-            # https://dspace.mit.edu/bitstream/handle/1721.1/841/P-0802-06587335.pdf.
-            # The QZ algorithm solves the generalized eigenvalue problem: given
-            # `L = [A, B; C, D]` and `M = [I_nxn 0]`, find all finite lambda
-            # for which there exist nontrivial solutions of the equation
-            # `Lz - lamba Mz`.
-            #
-            # The generalized eigenvalue problem is only solvable if its
-            # arguments are square matrices.
-            L = concatenate((concatenate((self.A, self.B), axis=1),
-                             concatenate((self.C, self.D), axis=1)), axis=0)
-            M = pad(eye(self.A.shape[0]), ((0, self.C.shape[0]),
-                                           (0, self.B.shape[1])), "constant")
-            return np.array([x for x in sp.linalg.eigvals(L, M,
-                                                          overwrite_a=True)
-                             if not isinf(x)])
+            # Number of inputs
+            m = self.B.shape[1]
+
+            # Number of states
+            n = self.A.shape[0]
+
+            # Number of outputs
+            p = self.C.shape[0]
+
+            mu = 0
+            nu = 0
+            sum = np.zeros(max(m, p))
+            dummy = np.zeros(max(m, n, p))
+            EPS = 1e-9
+
+            # Construct the compound matrix of dimension (N + P) x (M + N)
+            BF = concatenate((concatenate((self.B, self.A), axis=1),
+                              concatenate((self.D, self.C), axis=1)), axis=0)
+
+            # Reduce this system to one with the same invariant zeros and with
+            # D full row rank MU (the normal rank of the original system).
+            ro = p
+            sigma = 0
+            mu, nu = self.reduce(BF, m, n, p, EPS, ro, sigma, sum, dummy)
+            rank = mu
+            if nu == 0:
+                print("HI")
+                return np.array([])
+
+            # Pertranspose the system
+            AF = BF[::-1, ::-1].T
+            p = m
+            n = nu
+            m = mu
+
+            # Reduce the system to one with the same invariant zeros and with D
+            # square invertible
+            ro = p - m
+            sigma = m
+            mu, nu = self.reduce(AF, max, m, n, p, EPS, ro, sigma, sum, dummy)
+            if nu == 0:
+                return np.array([])
+
+            # Perform a unitary transformation on the columns of |λI-A B| to
+            #              |λBF-AF X|                            | -C  D|
+            # reduce it to |  0    Y| with Y and BF square invertible
+            for i in range(1, nu + 1):
+                for j in range(1, m + nu + 1):
+                    BF[i - 1, j - 1] = 0
+                BF[i - 1, i + m - 1] = 1
+            if rank == 0:
+                return sp.linalg.eigvals(AF[0:nu,0:nu], BF[0:nu,0:nu])
+            nu1 = nu + 1
+            i1 = nu + mu
+            j1 = mnu + 1
+            i0 = m
+            for i in range(1, m + 1):
+                i0 -= 1
+                for j in range(1, nu1 + 1):
+                    dummy[j - 1] = AF[i1 - 1, i0 + j - 1]
+                self.housh(dummy, nu1, nu1, EPS, zero, s)
+                self.tr2(AF, max, dummy, s, 1, i1, i0, nu1)
+                self.tr2(BF, max, dummy, s, 1, nu, i0, nu1)
+                i1 -= 1
+
+            return sp.linalg.eigvals(AF[0:nu,0:nu], BF[0:nu,0:nu])
+            #return np.array([x for x in sp.linalg.eigvals(L, M)
+            #                 if not isinf(x)])
+
+    def reduce(self, ABCD, m, n, p, EPS, ro, sigma, sum, dummy):
+        """Extracts from the (n + p) x (m + n) system |B A| a
+                                              |B' A'| |D C|
+        (nu + mu) x (m + nu) "reduced" system |D' C'| having the same
+        transmission zeros but with D' of full row rank. The system
+        (A', B', C', D') overwrites the old system. Eps is the noise level.
+        sum(max(p, m)) and dummy(max(p, n)) are working arrays.
+
+        Returns:
+        mu
+        nu
+        """
+        ibar = 0
+        zero = False
+        s = 0
+        mu = p
+        nu = n
+        if mu == 0:
+            return mu, nu
+        ro1 = ro
+        mnu = m + nu
+        numu = nu + mu
+        while mu != 0:
+            print("mu=", mu, "nu=", nu)
+            ro1 += 1
+            irow = nu
+            if sigma > 1:
+                # Compress rows of D. First exploit triangular shape
+                m1 = sigma - 1
+                for icol in range(1, m1 + 1):
+                    for j in range(1, ro1 + 1):
+                        dummy[j - 1] = ABCD[irow + j - 1, icol - 1]
+                    self.housh(dummy, ro1, 1, EPS, zero, s)
+                    self.tr1(ABCD, dummy, s, irow, ro1, icol, mnu)
+                irow += 1
+            # Continue with householder with pivoting
+            if sigma == 0:
+                sigma = 1
+                ro1 -= 1
+            if sigma != m:
+                for icol in range(sigma, m + 1):
+                    dum = 0
+                    for j in range(1, ro1):
+                        dum += ABCD[irow + j - 1, icol - 1]**2
+                    sum[icol - 1] = dum
+            for icol in range(sigma, m + 1):
+                # Pivot if necessary
+                if icol != m:
+                    sum, dum, ibar = self.pivot(sum, dum, ibar, icol, m)
+                    if ibar == icol:
+                        continue
+                    sum[ibar - 1] = sum[icol - 1]
+                    sum[icol - 1] = dum
+                    for i in range(1, numu + 1):
+                        dum = ABCD[i - 1, icol - 1]
+                        ABCD[i - 1, icol - 1] = ABCD[i - 1, ibar - 1]
+                        ABCD[i - 1, ibar - 1] = dum
+                # Perform householder transformation
+                for i in range(1, ro1 + 1):
+                    dummy[i] = ABCD[irow + i - 1, icol - 1]
+                self.housh(dummy, ro1, 1, EPS, zero, s)
+                if zero:
+                    break
+                if ro1 == 1:
+                    return mu, nu
+                self.tr1(ABCD, dummy, s, irow, ro1, icol, mnu)
+                irow += 1
+                ro1 -= 1
+                for j in range(icol, m + 1):
+                    sum[j - 1] -= ABCD[irow - 1, j - 1]**2
+            tau = ro1
+            sigma = mu - tau
+            # Compress the columns of C
+            if nu <= 0:
+                break
+            i1 = nu + sigma
+            mm1 = m + 1
+            n1 = nu
+            if tau != 1:
+                for i in range(1, tau + 1):
+                    dum = 0
+                    for j in range(mm1, mnu):
+                        dum += ABCD[i1 + i - 1, j - 1]**2
+                    sum[i - 1] = dum
+            for ro1 in range(1, tau + 1):
+                ro = ro1 - 1
+                i = tau - ro
+                i2 = i + i1
+                # Pivot if necessary
+                if i != 1:
+                    sum, dum, ibar = self.pivot(sum, dum, ibar, 1, i)
+                    if ibar != i:
+                        sum[ibar - 1] = sum[i - 1]
+                        sum[i - 1] = dum
+                        for j in range(mm1, mnu + 1):
+                            dum = ABCD[i2 - 1, j - 1]
+                            ABCD[i2 - 1, j - 1] = ABCD[ibar + i1 - 1, j - 1]
+                            ABCD[ibar + i1 - 1, j - 1] = dum
+                # Perform householder transformation
+                for j in range(1, n1 + 1):
+                    dummy[j - 1] = ABCD[i2 - 1, m + j - 1]
+                self.housh(dummy, n1, n1, EPS, zero, s)
+                if not zero:
+                    if n1 != 1:
+                        self.tr2(ABCD, dummy, s, 1, i2, m, n1)
+                        mn1 = m + n1
+                        self.tr1(ABCD, dummy, s, 0, n1, 1, mn1)
+                        for j in range(1, i + 1):
+                            sum[j - 1] -= ABCD[i1 + j - 1, mn1 - 1]**2
+                        mnu -= 1
+                n1 -= 1
+            ro = tau
+            nu -= ro
+            mu = sigma + ro
+            if ro == 0:
+                return mu, nu
+        print("ASDF")
+        return sigma, 0
+
+    def pivot(self, norm, max, ibar, i1, i2):
+        """Computes the maximal element (max) of the vector norm(i1, ..., i2)
+        and its location ibar.
+
+        Returns:
+        norm
+        max
+        ibar
+        """
+        ibar = i1
+        max = norm[1 - 1]
+        i11 = i1 + 1
+        if i11 > i2:
+            return norm, max, ibar
+        for i in range(i11, i2 + 1):
+            if max < norm[i - 1]:
+                max = norm[i - 1]
+                ibar = i
+        return norm, max, ibar
+
+    def housh(self, dummy, k, j, EPS, zero, s):
+        """Constructs a householder transformation H = I - s.UU' that 'mirrors'
+        a vector dummy(1, ..., k) to the jth unit vector.
+
+        If norm(dummy) < EPS, zero is put equal to True. Upon return, U is
+        stored in dummy.
+
+        Returns:
+        dummy
+        zero
+        """
+        import math
+
+        zero = True
+        s = 0
+        for i in range(1, k + 1):
+            s += dummy[i - 1]**2
+        alfa = math.sqrt(s)
+        if alfa < EPS:
+            return dummy, zero
+        zero = False
+        dum1 = dummy[j - 1]
+        if dum1 > 0:
+            alfa = -alfa
+        dummy[j - 1] = dum1 - alfa
+        s = 1.0 / (s - alfa * dum1)
+
+        return dummy, zero
+
+    def tr1(self, A, U, s, i1, i2, j1, j2):
+        """Performs the householder transformation H = I - s.UU' on the rows
+        i1 + 1 to i1 + i2 of A, this from columns j1 to j2.
+        """
+        for j in range(j1, j2 + 1):
+            inprod = 0
+            for i in range(1, i2 + 1):
+                inprod += U[i - 1] * A[i1 + i - 1, j - 1]
+            y = inprod * s
+            for i in range(1, i2 + 1):
+                A[i1 + i - 1, j - 1] -= U[i - 1] * y
+
+    def tr2(self, A, U, s, i1, i2, j1, j2):
+        """Performs the householder transformation H = I - S.UU' on the columns
+        j1 + 1 to j1 + j2 of A, this from rows i1 to i2.
+        """
+        for i in range(i1, i2 + 1):
+            inprod = 0
+            for j in range(1, j2 + 1):
+                inprod += U[j - 1] * A[i - 1, j1 + j - 1]
+            y = inprod * s
+            for j in range(1, j2 + 1):
+                A[i - 1, j1 + j - 1] -= U[j - 1] * y
 
     # Feedback around a state space system
     def feedback(self, other=1, sign=-1):
