@@ -437,13 +437,6 @@ def lqr(*args, **keywords):
     >>> K, S, E = lqr(A, B, Q, R, [N])
     """
 
-    # Make sure that SLICOT is installed
-    try:
-        from slycot import sb02md
-        from slycot import sb02mt
-    except ImportError:
-        raise ControlSlycot("can't find slycot module 'sb02md' or 'sb02nt'")
-
     #
     # Process the arguments and figure out what inputs we received
     #
@@ -483,19 +476,35 @@ def lqr(*args, **keywords):
           N.shape[0] != nstates or N.shape[1] != ninputs):
         raise ControlDimension("incorrect weighting matrix dimensions")
 
-    # Compute the G matrix required by SB02MD
-    A_b, B_b, Q_b, R_b, L_b, ipiv, oufact, G = \
-        sb02mt(nstates, ninputs, B, R, A, Q, N, jobl='N')
+    try:
+        from slycot import sb02md
+        from slycot import sb02mt
 
-    # Call the SLICOT function
-    X, rcond, w, S, U, A_inv = sb02md(nstates, A_b, G, Q_b, 'C')
+        # Compute the G matrix required by SB02MD
+        A_b, B_b, Q_b, R_b, L_b, ipiv, oufact, G = \
+            sb02mt(nstates, ninputs, B, R, A, Q, N, jobl='N')
 
-    # Now compute the return value
-    # We assume that R is positive definite and, hence, invertible
-    K = np.linalg.solve(R, np.dot(B.T, X) + N.T)
-    S = X
-    E = w[0:nstates]
+        # Call the SLICOT function
+        X, rcond, w, S, U, A_inv = sb02md(nstates, A_b, G, Q_b, 'C')
 
+        # Now compute the return value
+        # We assume that R is positive definite and, hence, invertible
+        K = np.linalg.solve(R, np.dot(B.T, X) + N.T);
+        S = X;
+        E = w[0:nstates];
+    except ImportError:
+        try:
+            dt = args[0].dt
+        except AttributeError:
+            dt = None
+        if dt == None:
+            S = sp.linalg.solve_continuous_are(a=A, b=B, q=Q, r=R, s=N)
+            K = np.linalg.solve(R, B.T.dot(S) + N.T)
+            E = np.linalg.eigvals(A - B.dot(K))
+        else:
+            S = sp.linalg.solve_discrete_are(a=A, b=B, q=Q, r=R, s=N)
+            K = np.linalg.solve(R + B.T.dot(S.dot(B)), B.T.dot(S.dot(A)) + N.T)
+            E = np.linalg.eigvals(A - B.dot(K))
     return _ssmatrix(K), _ssmatrix(S), E
 
 
